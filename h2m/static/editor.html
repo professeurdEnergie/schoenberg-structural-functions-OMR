@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>h2m editor</title>
+<style>
+  :root { --S:#d62728; --A:#ff7f0e; --T:#2ca02c; --B:#1f77b4; --none:#777; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px system-ui, sans-serif; display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:6px 10px; border-bottom:1px solid #ccc; background:#f6f6f6; }
+  header label { display:flex; align-items:center; gap:4px; }
+  header input[type=number] { width:58px; }
+  #voices { display:flex; gap:6px; }
+  button { cursor:pointer; }
+  .vt { font-weight:600; padding:1px 6px; border-radius:3px; color:#fff; }
+  main { flex:1; display:flex; min-height:0; }
+  #wrap { flex:1; overflow:auto; background:#ddd; position:relative; }
+  canvas { display:block; cursor:crosshair; }
+  aside { width:360px; overflow:auto; border-left:1px solid #ccc; padding:8px 10px; }
+  h3 { margin:10px 0 4px; font-size:13px; }
+  table { border-collapse:collapse; }
+  td, th { border:1px solid #ddd; padding:1px 5px; text-align:center; font-variant-numeric:tabular-nums; }
+  td.clk { cursor:pointer; } td.sel { outline:2px solid #000; } td.held { color:#aaa; }
+  th.playing { background:#ffe58a; }
+  .flag { padding:3px 5px; margin:2px 0; border-radius:3px; cursor:pointer; }
+  .flag.error { background:#fde2e1; } .flag.warning { background:#fff4d6; }
+  #status { color:#a00; }
+  kbd { border:1px solid #bbb; border-radius:3px; padding:0 3px; background:#fafafa; font-size:11px; }
+  #help td { text-align:left; border:none; padding:0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <b id="title">h2m</b>
+  <label>Key <select id="key"></select></label>
+  <label>Tempo <input id="tempo" type="number" min="10" max="400" step="5"></label>
+  <label>Beats/chord <input id="beats" type="number" min="0.25" step="0.25"></label>
+  <label title="A voice missing from a printed chord sustains its previous note"><input id="hold" type="checkbox"> hold missing voices</label>
+  <button id="play">Play</button>
+  <span id="voices"></span>
+  <label><input id="audition" type="checkbox" checked> audition edits</label>
+  <button id="zoomout">&minus;</button><span id="zoomlbl"></span><button id="zoomin">+</button>
+  <button id="undo">Undo</button>
+  <a id="dl" href="/api/midi">Download MIDI</a>
+  <span id="status"></span>
+</header>
+<main>
+  <div id="wrap"><canvas id="cv"></canvas></div>
+  <aside>
+    <h3>Selected</h3><div id="sel">nothing (click a notehead)</div>
+    <h3>Chords</h3><div id="chords"></div>
+    <h3>Flags <span id="nflags"></span></h3><div id="flags"></div>
+    <h3>Keys</h3>
+    <table id="help">
+      <tr><td>click</td><td>place notehead (snaps to line/space) or select one</td></tr>
+      <tr><td><kbd>Shift</kbd>+click</td><td>add / remove barline (resets accidentals)</td></tr>
+      <tr><td><kbd>Up</kbd> <kbd>Down</kbd></td><td>move selected note one staff step</td></tr>
+      <tr><td><kbd>1</kbd>..<kbd>5</kbd> <kbd>0</kbd></td><td>printed accidental: 1 double flat, 2 flat, 3 natural, 4 sharp, 5 double sharp, 0 none</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>type a pitch (e.g. Bbb4, F#3)</td></tr>
+      <tr><td><kbd>s</kbd> <kbd>a</kbd> <kbd>t</kbd> <kbd>b</kbd> / <kbd>u</kbd></td><td>force voice / back to automatic</td></tr>
+      <tr><td><kbd>d</kbd></td><td>duplicate: one notehead shared by two voices</td></tr>
+      <tr><td><kbd>c</kbd></td><td>confirm (sets confidence to 1)</td></tr>
+      <tr><td><kbd>Left</kbd> <kbd>Right</kbd></td><td>previous / next note</td></tr>
+      <tr><td><kbd>Del</kbd></td><td>delete selected note</td></tr>
+      <tr><td><kbd>Space</kbd> / <kbd>p</kbd></td><td>play all / play selected chord</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>undo</td></tr>
+    </table>
+  </aside>
+</main>
+<script>
+"use strict";
+const VOICES = ["S", "A", "T", "B"];
+const COLORS = {S: "#d62728", A: "#ff7f0e", T: "#2ca02c", B: "#1f77b4"};
+const ACC_KEYS = {"1": "bb", "2": "b", "3": "n", "4": "#", "5": "x", "0": null};
+// ASCII spelling everywhere (Bbb4, F#3, Fx4): music glyphs are missing from many fonts,
+// and a tofu box where a double flat should be would defeat the point of checking.
+const ACC_NAME = {bb: "double flat", b: "flat", n: "natural", "#": "sharp", x: "double sharp"};
+const KEY_NAMES = {"-7":"Cb / ab","-6":"Gb / eb","-5":"Db / bb","-4":"Ab / f","-3":"Eb / c","-2":"Bb / g","-1":"F / d",
+  "0":"C / a","1":"G / e","2":"D / b","3":"A / f#","4":"E / c#","5":"B / g#","6":"F# / d#","7":"C# / a#"};
+
+let state = null, selected = null, zoom = 2, playing = null, playCol = -1;
+const muted = {S: false, A: false, T: false, B: false};
+const img = new Image();
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+
+const pitchLabel = p => p;  // keep "Bbb4" exactly as stored / typed
+const noteById = id => state.score.notes.find(n => n.id === id);
+const flagged = () => {
+  const lv = {};
+  for (const f of state.flags) for (const id of f.note_ids)
+    if (lv[id] !== "error") lv[id] = f.level;
+  return lv;
+};
+
+async function api(op) {
+  const r = await fetch("/api/op", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(op)});
+  const data = await r.json();
+  if (data.error) { setStatus(data.error); return null; }
+  setStatus("");
+  state = data;
+  if ("selected" in data) selected = data.selected;
+  render();
+  return data;
+}
+function setStatus(t) { document.getElementById("status").textContent = t; }
+
+async function load() {
+  state = await (await fetch("/api/state")).json();
+  const ks = document.getElementById("key");
+  for (let f = -7; f <= 7; f++) ks.add(new Option(`${f > 0 ? f + " sharps" : f < 0 ? -f + " flats" : "none"} (${KEY_NAMES[f]})`, f));
+  const vs = document.getElementById("voices");
+  for (const v of VOICES) {
+    const b = document.createElement("label");
+    b.innerHTML = `<input type="checkbox" checked data-v="${v}"><span class="vt" style="background:${COLORS[v]}">${v}</span>`;
+    b.querySelector("input").onchange = e => { muted[v] = !e.target.checked; };
+    vs.appendChild(b);
+  }
+  img.onload = () => render();
+  img.src = "/image.png";
+}
+
+// ---------------------------------------------------------------- drawing
+function staffLines(st) {  // [[x, top, bottom], ...] -> 5 polylines
+  return [0, 1, 2, 3, 4].map(k => st.samples.map(([x, t, b]) => [x, t + k * (b - t) / 4]));
+}
+function topBottomAt(st, x) {
+  const s = st.samples;
+  if (s.length === 1) return [s[0][1], s[0][2]];
+  let i = s.findIndex(p => p[0] >= x);
+  if (i === -1) i = s.length - 1;  // right of the last sample: extrapolate the last segment
+  if (i < 1) i = 1;
+  const [x0, t0, b0] = s[i - 1], [x1, t1, b1] = s[i], f = (x - x0) / ((x1 - x0) || 1);
+  return [t0 + f * (t1 - t0), b0 + f * (b1 - b0)];
+}
+
+function render() {
+  if (!state || !img.complete || !img.naturalWidth) return;
+  const sc = state.score, dpr = window.devicePixelRatio || 1;
+  const W = img.naturalWidth, H = img.naturalHeight;
+  cv.width = Math.round(W * zoom * dpr); cv.height = Math.round(H * zoom * dpr);
+  cv.style.width = W * zoom + "px"; cv.style.height = H * zoom + "px";
+  ctx.setTransform(zoom * dpr, 0, 0, zoom * dpr, 0, 0);
+  ctx.drawImage(img, 0, 0);
+  const lw = 1 / zoom;
+
+  // detected staff lines
+  ctx.lineWidth = lw; ctx.strokeStyle = "rgba(0,170,255,0.55)";
+  for (const st of sc.staves) for (const line of staffLines(st)) {
+    ctx.beginPath(); line.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+  }
+  // barlines
+  ctx.strokeStyle = "rgba(200,0,200,0.7)"; ctx.setLineDash([4 / zoom, 3 / zoom]); ctx.lineWidth = 1.5 * lw;
+  for (const b of sc.barlines) {
+    const members = sc.staves.filter(s => s.system === b.system);
+    if (!members.length) continue;
+    const y0 = Math.min(...members.map(s => topBottomAt(s, b.x)[0])), y1 = Math.max(...members.map(s => topBottomAt(s, b.x)[1]));
+    ctx.beginPath(); ctx.moveTo(b.x, y0 - 8); ctx.lineTo(b.x, y1 + 8); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // chord numbers (+ playing highlight)
+  const sp0 = state.staff_spacing[0] || 10;
+  ctx.font = `${Math.max(9, sp0 * 1.1)}px system-ui`; ctx.textAlign = "center";
+  for (const c of state.columns) {
+    if (c.x == null) continue;
+    const ns = c.notes.map(noteById).filter(n => n.loc);
+    const top = Math.min(...ns.map(n => topBottomAt(sc.staves[n.loc.staff], c.x)[0])) - 4.5 * sp0;
+    if (c.index === playCol) {
+      ctx.fillStyle = "rgba(255,215,0,0.30)";
+      ctx.fillRect(c.x - 1.6 * sp0, top, 3.2 * sp0, Math.max(...ns.map(n => n.loc.y)) - top + 2 * sp0);
+    }
+    ctx.fillStyle = "#555"; ctx.fillText(String(c.index + 1), c.x, top + sp0);
+  }
+
+  // notes
+  const lv = flagged();
+  ctx.textAlign = "left";
+  for (const n of sc.notes) {
+    if (!n.loc) continue;
+    const sp = state.staff_spacing[n.loc.staff] || 10, r = 0.62 * sp, col = COLORS[n.voice] || "#777";
+    const {x, y} = n.loc;
+    ctx.beginPath(); ctx.ellipse(x, y, r * 1.15, r, 0, 0, 2 * Math.PI);
+    ctx.fillStyle = col + "33"; ctx.fill();
+    ctx.lineWidth = Math.max(1.6 * lw, sp * 0.14); ctx.strokeStyle = col;
+    if (n.confidence < 0.5) ctx.setLineDash([sp * 0.3, sp * 0.2]);
+    ctx.stroke(); ctx.setLineDash([]);
+    if (lv[n.id]) {
+      ctx.beginPath(); ctx.ellipse(x, y, r * 1.6, r * 1.45, 0, 0, 2 * Math.PI);
+      ctx.lineWidth = Math.max(1.2 * lw, sp * 0.1); ctx.strokeStyle = lv[n.id] === "error" ? "#e00" : "#e8a400"; ctx.stroke();
+    }
+    if (n.id === selected) {
+      ctx.beginPath(); ctx.ellipse(x, y, r * 2.0, r * 1.85, 0, 0, 2 * Math.PI);
+      ctx.lineWidth = Math.max(2 * lw, sp * 0.16); ctx.strokeStyle = "#000"; ctx.stroke();
+    }
+    ctx.font = `bold ${Math.max(8, sp * 0.85)}px system-ui, sans-serif`;
+    const label = pitchLabel(n.pitch) + (n.voice_locked ? "*" : "");  // * = voice forced by you
+    ctx.lineWidth = 3 * lw; ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.strokeText(label, x + r * 1.5, y + sp * 0.35); ctx.fillStyle = col; ctx.fillText(label, x + r * 1.5, y + sp * 0.35);
+  }
+  renderSide();
+}
+
+function renderSide() {
+  const sc = state.score;
+  document.getElementById("title").textContent = sc.title || "h2m";
+  const set = (id, v) => { const e = document.getElementById(id); if (document.activeElement !== e) e.value = v; };
+  set("key", sc.key_fifths); set("tempo", sc.tempo_bpm); set("beats", sc.chord_duration);
+  document.getElementById("hold").checked = sc.hold_missing_voices;
+  document.getElementById("zoomlbl").textContent = ` ${Math.round(zoom * 100)}% `;
+
+  const n = selected && noteById(selected);
+  document.getElementById("sel").innerHTML = !n ? "nothing (click a notehead)" :
+    `<b style="color:${COLORS[n.voice] || "#777"}">${pitchLabel(n.pitch)}</b> (MIDI ${n.midi}) &nbsp;
+     voice <b>${n.voice || "?"}</b>${n.voice_locked ? " (forced)" : " (auto)"}<br>
+     printed accidental: ${n.accidental ? ACC_NAME[n.accidental] : "none (key signature / earlier in bar)"}<br>
+     confidence ${n.confidence.toFixed(2)}<br>
+     onset ${n.onset} beats, duration ${n.duration}` +
+    (n.loc ? `<br>staff ${n.loc.staff} (${sc.staves[n.loc.staff].clef}), step ${n.loc.step}, x ${Math.round(n.loc.x)}` : "");
+
+  let h = "<table><tr><th></th>" + state.columns.map(c => `<th class="${c.index === playCol ? "playing" : ""}">${c.index + 1}</th>`).join("") + "</tr>";
+  for (const v of VOICES) {
+    h += `<tr><th style="color:${COLORS[v]}">${v}</th>`;
+    for (const c of state.columns) {
+      const id = c.notes.find(i => noteById(i).voice === v);
+      if (id) h += `<td class="clk ${id === selected ? "sel" : ""}" data-id="${id}">${pitchLabel(noteById(id).pitch)}</td>`;
+      else if (c.sounding[v]) h += `<td class="held clk" data-id="${c.sounding[v]}">~</td>`;
+      else h += "<td>&ndash;</td>";
+    }
+    h += "</tr>";
+  }
+  const un = sc.notes.filter(n => !VOICES.includes(n.voice));
+  document.getElementById("chords").innerHTML = h + "</table>" + (un.length ? `<div>unassigned: ${un.map(n => pitchLabel(n.pitch)).join(" ")}</div>` : "");
+  document.querySelectorAll("#chords td.clk").forEach(td => td.onclick = () => select(td.dataset.id, true));
+
+  document.getElementById("nflags").textContent = state.flags.length ? `(${state.flags.length})` : "- none";
+  const fl = document.getElementById("flags");
+  fl.innerHTML = state.flags.map((f, i) => `<div class="flag ${f.level}" data-i="${i}"><b>${f.level}</b>: ${f.message}</div>`).join("");
+  fl.querySelectorAll(".flag").forEach(d => d.onclick = () => { const f = state.flags[+d.dataset.i]; if (f.note_ids.length) select(f.note_ids[0], true); });
+}
+
+// ---------------------------------------------------------------- audio
+let actx = null, master = null, wave = null;
+function audio() {
+  if (!actx) {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = actx.createDynamicsCompressor(); comp.connect(actx.destination);
+    master = actx.createGain(); master.gain.value = 0.8; master.connect(comp);
+    const real = new Float32Array([0, 1, 0.45, 0.25, 0.12, 0.06]), imag = new Float32Array(real.length);
+    wave = actx.createPeriodicWave(real, imag);  // soft organ-like tone
+  }
+  if (actx.state === "suspended") actx.resume();
+  return actx;
+}
+function tone(midi, t0, dur, active) {
+  const ac = audio(), o = ac.createOscillator(), g = ac.createGain();
+  o.setPeriodicWave(wave); o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  const d = Math.max(0.08, dur), peak = 0.13;
+  g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(peak, t0 + 0.02);
+  g.gain.setValueAtTime(peak, t0 + d - 0.05); g.gain.linearRampToValueAtTime(0, t0 + d);
+  o.connect(g).connect(master); o.start(t0); o.stop(t0 + d + 0.02);
+  active.push(o);
+}
+function stop() {
+  if (playing) { playing.osc.forEach(o => { try { o.stop(); } catch (e) {} }); cancelAnimationFrame(playing.raf); }
+  playing = null; playCol = -1; document.getElementById("play").textContent = "Play"; render();
+}
+function playAll() {
+  if (playing) return stop();
+  const ac = audio(), spb = 60 / state.score.tempo_bpm, t0 = ac.currentTime + 0.1, osc = [];
+  for (const n of state.score.notes)
+    if (VOICES.includes(n.voice) && !muted[n.voice]) tone(n.midi, t0 + n.onset * spb, n.duration * spb - 0.03, osc);
+  const end = Math.max(0, ...state.score.notes.map(n => n.onset + n.duration)) * spb;
+  playing = {osc, raf: 0};
+  document.getElementById("play").textContent = "Stop";
+  const tick = () => {
+    const t = ac.currentTime - t0;
+    if (t > end + 0.1) return stop();
+    let c = -1; for (const col of state.columns) if (col.onset * spb <= t) c = col.index;
+    if (c !== playCol) { playCol = c; render(); }
+    playing.raf = requestAnimationFrame(tick);
+  };
+  playing.raf = requestAnimationFrame(tick);
+}
+function playColumnOf(id) {
+  const col = state.columns.find(c => c.notes.includes(id) || Object.values(c.sounding).includes(id));
+  if (!col) return;
+  const ac = audio(), t0 = ac.currentTime + 0.02, tmp = [];
+  for (const [v, nid] of Object.entries(col.sounding)) if (!muted[v]) tone(noteById(nid).midi, t0, 0.9, tmp);
+  for (const nid of col.notes) { const n = noteById(nid); if (!VOICES.includes(n.voice)) tone(n.midi, t0, 0.9, tmp); }
+}
+function audition(id) { if (id && document.getElementById("audition").checked && !playing) playColumnOf(id); }
+
+// ---------------------------------------------------------------- interaction
+function select(id, play) { selected = id; render(); if (play) audition(id); }
+function hit(x, y) {
+  let best = null, bd = Infinity;
+  for (const n of state.score.notes) {
+    if (!n.loc) continue;
+    const sp = state.staff_spacing[n.loc.staff] || 10, d = Math.hypot(n.loc.x - x, (n.loc.y - y) * 1.15);
+    if (d < 0.55 * sp && d < bd) { bd = d; best = n.id; }
+  }
+  return best;
+}
+cv.addEventListener("mousedown", async e => {
+  if (!state) return;
+  const x = e.offsetX / zoom, y = e.offsetY / zoom;
+  if (e.shiftKey) return api({op: "barline", x, y});
+  const h = hit(x, y);
+  if (h) return select(h, true);
+  const r = await api({op: "add", x, y});
+  if (r) audition(r.selected);
+});
+
+const ordered = () => [...state.score.notes].sort((a, b) => a.onset - b.onset || b.midi - a.midi);
+document.addEventListener("keydown", async e => {
+  if (!state || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  const k = e.key, id = selected;
+  if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === "z") { e.preventDefault(); return api({op: "undo", id}); }
+  if (k === " ") { e.preventDefault(); return playAll(); }
+  if (k === "Escape") return select(null);
+  if (k === "ArrowLeft" || k === "ArrowRight") {
+    e.preventDefault();
+    const o = ordered(); if (!o.length) return;
+    const i = o.findIndex(n => n.id === id);
+    const j = i < 0 ? 0 : Math.max(0, Math.min(o.length - 1, i + (k === "ArrowRight" ? 1 : -1)));
+    return select(o[j].id, true);
+  }
+  if (!id) return;
+  let r = null;
+  if (k === "ArrowUp" || k === "ArrowDown") { e.preventDefault(); r = await api({op: "move", id, delta: k === "ArrowUp" ? 1 : -1}); }
+  else if (k in ACC_KEYS) r = await api({op: "accidental", id, accidental: ACC_KEYS[k]});
+  else if ("satb".includes(k) && k.length === 1) r = await api({op: "voice", id, voice: k.toUpperCase()});
+  else if (k === "u") r = await api({op: "voice", id, voice: null});
+  else if (k === "d") r = await api({op: "duplicate", id});
+  else if (k === "c") r = await api({op: "confirm", id});
+  else if (k === "p") return playColumnOf(id);
+  else if (k === "Delete" || k === "Backspace") { e.preventDefault(); return api({op: "delete", id}); }
+  else if (k === "Enter") {
+    const p = prompt("Pitch (e.g. Bbb4, F#3, C5):", noteById(id).pitch);
+    if (p) r = await api({op: "set_pitch", id, pitch: p});
+  }
+  if (r) audition(r.selected);
+});
+
+document.querySelectorAll("button").forEach(b => b.addEventListener("click", () => b.blur()));  // keep Space for playback
+document.getElementById("play").onclick = playAll;
+document.getElementById("undo").onclick = () => api({op: "undo", id: selected});
+document.getElementById("zoomin").onclick = () => { zoom = Math.min(8, zoom * 1.25); render(); };
+document.getElementById("zoomout").onclick = () => { zoom = Math.max(0.25, zoom / 1.25); render(); };
+document.getElementById("key").onchange = e => api({op: "settings", key_fifths: +e.target.value});
+document.getElementById("tempo").onchange = e => api({op: "settings", tempo_bpm: +e.target.value});
+document.getElementById("beats").onchange = e => api({op: "settings", chord_duration: +e.target.value});
+document.getElementById("hold").onchange = e => api({op: "settings", hold_missing_voices: e.target.checked});
+document.getElementById("dl").onclick = e => {  // honour muted voices: download only what you hear
+  const v = VOICES.filter(x => !muted[x]).join("");
+  e.currentTarget.href = "/api/midi" + (v.length && v.length < 4 ? "?voices=" + v : "");
+};
+load();
+</script>
+</body>
+</html>
